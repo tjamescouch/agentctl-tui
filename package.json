@@ -14,6 +14,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "blessed": "^0.1.81"
+    "blessed": "^0.1.81",
+    "ws": "^8.19.0"
   }
 }

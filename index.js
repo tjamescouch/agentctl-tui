@@ -4,16 +4,22 @@
 const blessed = require('blessed');
 const fs = require('fs');
 const path = require('path');
-const { execFile, spawn } = require('child_process');
+const { execFile } = require('child_process');
 const os = require('os');
+const WebSocket = require('ws');
 
 // --- Config ---
 const AGENTS_DIR = path.join(os.homedir(), '.agentchat', 'agents');
 const POLL_INTERVAL = 3000;
 const LOG_TAIL_LINES = 100;
 const DEBOUNCE_MS = 100;
+const CHAT_SERVER = 'wss://agentchat-server.fly.dev';
+const CHAT_NAME = 'server';
+const DEFAULT_CHANNEL = '#general';
+const RECONNECT_DELAY = 5000;
+const MAX_MSG_LEN = 4096;
 
-// Find agentctl.sh - search known locations
+// --- Find agentctl.sh ---
 function findAgentctl() {
   const candidates = [
     path.join(os.homedir(), 'dev/claude/agentchat/lib/supervisor/agentctl.sh'),
@@ -81,12 +87,6 @@ function readAgent(name) {
     try { mission = fs.readFileSync(missionFile, 'utf8').trim(); } catch {}
   }
 
-  let stateData = {};
-  const stateFile = path.join(dir, 'state.json');
-  if (fs.existsSync(stateFile)) {
-    try { stateData = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch {}
-  }
-
   let uptime = null;
   if (status === 'running' && pid) {
     try {
@@ -95,7 +95,7 @@ function readAgent(name) {
     } catch {}
   }
 
-  return { name, dir, status, pid, mission, stateData, uptime };
+  return { name, dir, status, pid, mission, uptime };
 }
 
 function scanAgents() {
@@ -103,8 +103,7 @@ function scanAgents() {
   try {
     return fs.readdirSync(AGENTS_DIR)
       .filter(name => {
-        const full = path.join(AGENTS_DIR, name);
-        return fs.statSync(full).isDirectory();
+        try { return fs.statSync(path.join(AGENTS_DIR, name)).isDirectory(); } catch { return false; }
       })
       .map(readAgent)
       .sort((a, b) => a.name.localeCompare(b.name));
@@ -130,7 +129,6 @@ function formatUptime(ms) {
 function createLogStreamer() {
   let watcher = null;
   let filePos = 0;
-  let currentFile = null;
   let debounceTimer = null;
 
   function tail(filePath, nLines) {
@@ -147,10 +145,7 @@ function createLogStreamer() {
   function readNew(filePath, onLines) {
     try {
       const stat = fs.statSync(filePath);
-      if (stat.size < filePos) {
-        // File was truncated/rotated
-        filePos = 0;
-      }
+      if (stat.size < filePos) filePos = 0;
       if (stat.size > filePos) {
         const fd = fs.openSync(filePath, 'r');
         const buf = Buffer.alloc(stat.size - filePos);
@@ -165,11 +160,8 @@ function createLogStreamer() {
 
   function start(logFile, onLines) {
     stop();
-    currentFile = logFile;
-
     if (!fs.existsSync(logFile)) {
-      onLines(['{grey-fg}No logs yet. Watching for output...{/grey-fg}']);
-      // Watch parent dir for file creation
+      onLines(['{grey-fg}No logs yet. Watching...{/grey-fg}']);
       const parentDir = path.dirname(logFile);
       if (fs.existsSync(parentDir)) {
         try {
@@ -202,10 +194,154 @@ function createLogStreamer() {
     if (watcher) { try { watcher.close(); } catch {} watcher = null; }
     if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
     filePos = 0;
-    currentFile = null;
   }
 
   return { start, stop };
+}
+
+// --- Chat Client ---
+
+function createChatClient(onMessage, onStatus) {
+  let ws = null;
+  let channel = DEFAULT_CHANNEL;
+  let agentId = null;
+  let reconnectTimer = null;
+  let intentionalClose = false;
+
+  function connect() {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    intentionalClose = false;
+    onStatus('connecting');
+
+    try {
+      ws = new WebSocket(CHAT_SERVER);
+    } catch (err) {
+      onStatus('error');
+      scheduleReconnect();
+      return;
+    }
+
+    ws.on('open', () => {
+      ws.send(JSON.stringify({ type: 'IDENTIFY', name: CHAT_NAME }));
+    });
+
+    ws.on('message', (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        handleServerMessage(msg);
+      } catch {}
+    });
+
+    ws.on('close', () => {
+      onStatus('disconnected');
+      if (!intentionalClose) scheduleReconnect();
+    });
+
+    ws.on('error', () => {
+      onStatus('error');
+    });
+  }
+
+  function handleServerMessage(msg) {
+    switch (msg.type) {
+      case 'WELCOME':
+        agentId = msg.agent_id;
+        onStatus('connected');
+        joinChannel(channel);
+        break;
+      case 'JOINED':
+        onMessage({ type: 'system', text: `Joined ${msg.channel}` });
+        break;
+      case 'LEFT':
+        onMessage({ type: 'system', text: `Left ${msg.channel}` });
+        break;
+      case 'MSG':
+        if (msg.to === channel || msg.to === `@${agentId}`) {
+          onMessage({
+            type: 'msg',
+            from: msg.name || msg.from || '?',
+            content: msg.content,
+            isSelf: msg.from === agentId,
+          });
+        }
+        break;
+      case 'AGENT_JOINED':
+        if (msg.channel === channel) {
+          onMessage({ type: 'system', text: `${msg.name || msg.agent} joined` });
+        }
+        break;
+      case 'AGENT_LEFT':
+        if (msg.channel === channel) {
+          onMessage({ type: 'system', text: `${msg.name || msg.agent} left` });
+        }
+        break;
+      case 'ERROR':
+        onMessage({ type: 'error', text: msg.message || 'Unknown error' });
+        break;
+    }
+  }
+
+  function joinChannel(ch) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'JOIN', channel: ch }));
+    }
+  }
+
+  function leaveChannel(ch) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'LEAVE', channel: ch }));
+    }
+  }
+
+  function switchChannel(newChannel) {
+    if (newChannel === channel) return;
+    leaveChannel(channel);
+    channel = newChannel;
+    joinChannel(channel);
+  }
+
+  function send(text) {
+    if (!text || !text.trim()) return;
+    if (text.length > MAX_MSG_LEN) {
+      text = text.slice(0, MAX_MSG_LEN);
+      onMessage({ type: 'system', text: `Message truncated to ${MAX_MSG_LEN} chars` });
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'MSG', to: channel, content: text.trim() }));
+    } else {
+      onMessage({ type: 'error', text: 'Not connected' });
+    }
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, RECONNECT_DELAY);
+  }
+
+  function disconnect() {
+    intentionalClose = true;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (ws) { try { ws.close(); } catch {} ws = null; }
+  }
+
+  function getChannel() { return channel; }
+  function isConnected() { return ws && ws.readyState === WebSocket.OPEN; }
+
+  return { connect, disconnect, send, switchChannel, getChannel, isConnected };
+}
+
+// --- Name Color ---
+
+function nameColor(name) {
+  const colors = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = ((hash << 5) - hash + name.charCodeAt(i)) | 0;
+  }
+  return colors[Math.abs(hash) % colors.length];
 }
 
 // --- TUI ---
@@ -217,16 +353,15 @@ function createUI() {
     fullUnicode: true,
   });
 
-  // Left column container
+  // === Left column: agents + detail ===
   const leftCol = blessed.box({
     parent: screen,
     top: 0,
     left: 0,
-    width: '30%',
-    height: '100%',
+    width: '25%',
+    height: '100%-1',
   });
 
-  // Agent list (top-left)
   const agentList = blessed.list({
     parent: leftCol,
     label: ' agents ',
@@ -248,7 +383,6 @@ function createUI() {
     tags: true,
   });
 
-  // Detail pane (bottom-left)
   const detailBox = blessed.box({
     parent: leftCol,
     label: ' detail ',
@@ -265,13 +399,13 @@ function createUI() {
     scrollable: true,
   });
 
-  // Log panel (right)
+  // === Center column: logs ===
   const logBox = blessed.log({
     parent: screen,
     label: ' logs ',
     top: 0,
-    left: '30%',
-    width: '70%',
+    left: '25%',
+    width: '40%',
     height: '100%-1',
     border: { type: 'line' },
     style: {
@@ -285,7 +419,51 @@ function createUI() {
     keys: true,
   });
 
-  // Status bar
+  // === Right column: chat ===
+  const chatCol = blessed.box({
+    parent: screen,
+    top: 0,
+    left: '65%',
+    width: '35%',
+    height: '100%-1',
+  });
+
+  const chatLog = blessed.log({
+    parent: chatCol,
+    label: ' #general ',
+    top: 0,
+    left: 0,
+    width: '100%',
+    height: '100%-3',
+    border: { type: 'line' },
+    style: {
+      border: { fg: 'magenta' },
+      label: { fg: 'magenta', bold: true },
+    },
+    tags: true,
+    scrollable: true,
+    scrollback: 500,
+    mouse: true,
+    keys: true,
+  });
+
+  const chatInput = blessed.textbox({
+    parent: chatCol,
+    bottom: 0,
+    left: 0,
+    width: '100%',
+    height: 3,
+    border: { type: 'line' },
+    style: {
+      border: { fg: 'magenta' },
+      fg: 'white',
+    },
+    inputOnFocus: true,
+    keys: true,
+    mouse: true,
+  });
+
+  // === Status bar ===
   const statusBar = blessed.box({
     parent: screen,
     bottom: 0,
@@ -301,9 +479,9 @@ function createUI() {
     screen.render();
   }
 
-  setStatus('[s]tart [x]stop [r]estart [k]ill [c]ontext [/]filter [q]uit');
+  setStatus('[s]tart [x]stop [r]estart [K]ill [c]ontext [/]filter [tab]focus [q]uit');
 
-  return { screen, agentList, detailBox, logBox, statusBar, setStatus };
+  return { screen, agentList, detailBox, logBox, chatLog, chatInput, statusBar, setStatus };
 }
 
 // --- Main ---
@@ -316,8 +494,53 @@ function main() {
   let selectedIdx = 0;
   let filterText = '';
   let filteredAgents = [];
-  let confirmAction = null; // { action, agent } for kill confirmation
-  let userScrolled = false;
+  let confirmAction = null;
+  let userScrolledLog = false;
+  let chatFocused = false;
+  let focusPanel = 'agents'; // agents | logs | chat
+
+  // --- Chat ---
+  let chatStatus = 'disconnected';
+
+  const chat = createChatClient(
+    (msg) => {
+      switch (msg.type) {
+        case 'msg': {
+          const color = msg.isSelf ? 'cyan' : nameColor(msg.from);
+          ui.chatLog.log(`{${color}-fg}${msg.from}{/${color}-fg}: ${msg.content}`);
+          break;
+        }
+        case 'system':
+          ui.chatLog.log(`{grey-fg}--- ${msg.text}{/grey-fg}`);
+          break;
+        case 'error':
+          ui.chatLog.log(`{red-fg}! ${msg.text}{/red-fg}`);
+          break;
+      }
+      ui.screen.render();
+    },
+    (status) => {
+      chatStatus = status;
+      updateStatusBar();
+      ui.screen.render();
+    }
+  );
+
+  function updateStatusBar() {
+    const chatIndicator = chatStatus === 'connected'
+      ? `{green-fg}●{/green-fg} ${chat.getChannel()}`
+      : chatStatus === 'connecting'
+        ? `{yellow-fg}◐{/yellow-fg} connecting`
+        : `{red-fg}○{/red-fg} disconnected`;
+
+    const focusIndicator = `[${focusPanel}]`;
+
+    ui.setStatus(
+      `[s]tart [x]stop [r]estart [K]ill [c]ontext [/]filter [tab]focus [q]uit  ${focusIndicator}  chat: ${chatIndicator}`
+    );
+  }
+
+  // --- Agent helpers ---
 
   function getSelected() {
     return filteredAgents[selectedIdx] || null;
@@ -350,7 +573,7 @@ function main() {
 
     const items = filteredAgents.map(a => {
       const icon = statusIcon(a.status);
-      const padded = a.name.padEnd(14);
+      const padded = a.name.padEnd(12);
       return `${icon} ${padded} {${statusColor(a.status)}-fg}${a.status}{/${statusColor(a.status)}-fg}`;
     });
 
@@ -380,9 +603,6 @@ function main() {
       '',
       `{bold}Mission:{/bold}`,
       `  ${agent.mission || '{grey-fg}(none){/grey-fg}'}`,
-      '',
-      '{cyan-fg}[s]{/cyan-fg}tart  {cyan-fg}[x]{/cyan-fg}stop  {cyan-fg}[r]{/cyan-fg}estart',
-      '{cyan-fg}[k]{/cyan-fg}ill   {cyan-fg}[c]{/cyan-fg}ontext {cyan-fg}[/]{/cyan-fg}filter',
     ];
 
     ui.detailBox.setContent(lines.join('\n'));
@@ -390,7 +610,7 @@ function main() {
 
   function switchLogStream() {
     const agent = getSelected();
-    userScrolled = false;
+    userScrolledLog = false;
     ui.logBox.setContent('');
 
     if (!agent) {
@@ -406,7 +626,7 @@ function main() {
       for (const line of lines) {
         ui.logBox.log(line);
       }
-      if (!userScrolled) {
+      if (!userScrolledLog) {
         ui.logBox.setScrollPerc(100);
       }
       ui.screen.render();
@@ -418,7 +638,6 @@ function main() {
     const prevSelected = getSelected()?.name;
     renderAgentList();
 
-    // Preserve selection
     if (prevSelected) {
       const idx = filteredAgents.findIndex(a => a.name === prevSelected);
       if (idx >= 0) {
@@ -440,7 +659,7 @@ function main() {
     const args = [command, agentName];
     if (extra) args.push(extra);
 
-    ui.setStatus(`Running: agentctl ${args.join(' ')}...`);
+    ui.logBox.log(`{yellow-fg}> agentctl ${args.join(' ')}{/yellow-fg}`);
 
     execFile('bash', [AGENTCTL, ...args], { timeout: 30000 }, (err, stdout, stderr) => {
       const output = (stdout || '') + (stderr || '');
@@ -451,12 +670,43 @@ function main() {
       if (err && !stdout && !stderr) {
         ui.logBox.log(`{red-fg}> Error: ${err.message}{/red-fg}`);
       }
-      ui.setStatus('[s]tart [x]stop [r]estart [k]ill [c]ontext [/]filter [q]uit');
+      updateStatusBar();
       ui.screen.render();
-      // Refresh after action
       setTimeout(refresh, 1000);
       if (callback) callback(err);
     });
+  }
+
+  // --- Focus management ---
+
+  function setFocus(panel) {
+    focusPanel = panel;
+    chatFocused = panel === 'chat';
+
+    // Reset all borders to default
+    ui.agentList.style.border.fg = 'cyan';
+    ui.detailBox.style.border.fg = 'cyan';
+    ui.logBox.style.border.fg = 'green';
+    ui.chatLog.style.border.fg = 'magenta';
+
+    switch (panel) {
+      case 'agents':
+        ui.agentList.style.border.fg = 'white';
+        ui.agentList.focus();
+        break;
+      case 'logs':
+        ui.logBox.style.border.fg = 'white';
+        ui.logBox.focus();
+        break;
+      case 'chat':
+        ui.chatLog.style.border.fg = 'white';
+        ui.chatInput.focus();
+        ui.chatInput.readInput(() => {});
+        break;
+    }
+
+    updateStatusBar();
+    ui.screen.render();
   }
 
   // --- Key bindings ---
@@ -470,9 +720,43 @@ function main() {
     }
   });
 
-  // j/k navigation
+  // Chat input handling
+  ui.chatInput.on('submit', (value) => {
+    if (!value || !value.trim()) {
+      setFocus('chat');
+      return;
+    }
+
+    const text = value.trim();
+
+    // Handle /join command
+    const joinMatch = text.match(/^\/join\s+(#\S+)/);
+    if (joinMatch) {
+      const newChannel = joinMatch[1];
+      chat.switchChannel(newChannel);
+      ui.chatLog.setContent('');
+      ui.chatLog.setLabel(` ${newChannel} `);
+      ui.chatInput.clearValue();
+      setFocus('chat');
+      ui.screen.render();
+      return;
+    }
+
+    chat.send(text);
+    ui.chatInput.clearValue();
+    setFocus('chat');
+    ui.screen.render();
+  });
+
+  ui.chatInput.on('cancel', () => {
+    ui.chatInput.clearValue();
+    setFocus('agents');
+  });
+
+  // Global keys (only when chat is NOT focused)
   ui.screen.key(['j'], () => {
-    if (selectedIdx < filteredAgents.length - 1) {
+    if (chatFocused) return;
+    if (focusPanel === 'agents' && selectedIdx < filteredAgents.length - 1) {
       selectedIdx++;
       ui.agentList.select(selectedIdx);
       renderDetail();
@@ -482,7 +766,8 @@ function main() {
   });
 
   ui.screen.key(['k'], () => {
-    if (selectedIdx > 0) {
+    if (chatFocused) return;
+    if (focusPanel === 'agents' && selectedIdx > 0) {
       selectedIdx--;
       ui.agentList.select(selectedIdx);
       renderDetail();
@@ -491,22 +776,20 @@ function main() {
     }
   });
 
-  // Start agent
   ui.screen.key(['s'], () => {
-    if (confirmAction) return;
+    if (chatFocused || confirmAction) return;
     const agent = getSelected();
     if (!agent) return;
 
     if (agent.status === 'running') {
-      ui.setStatus(`{yellow-fg}${agent.name} is already running{/yellow-fg}`);
-      setTimeout(() => ui.setStatus('[s]tart [x]stop [r]estart [k]ill [c]ontext [/]filter [q]uit'), 2000);
+      ui.logBox.log(`{yellow-fg}${agent.name} is already running{/yellow-fg}`);
+      ui.screen.render();
       return;
     }
 
     if (agent.mission) {
       runAgentctl('start', agent.name, agent.mission);
     } else {
-      // Prompt for mission
       const input = blessed.textbox({
         parent: ui.screen,
         top: 'center',
@@ -515,7 +798,7 @@ function main() {
         height: 3,
         border: { type: 'line' },
         style: { border: { fg: 'yellow' }, fg: 'white', bg: 'black' },
-        label: ' mission for ' + agent.name + ' ',
+        label: ` mission for ${agent.name} `,
         inputOnFocus: true,
       });
       input.focus();
@@ -530,35 +813,33 @@ function main() {
     }
   });
 
-  // Stop agent
   ui.screen.key(['x'], () => {
-    if (confirmAction) return;
+    if (chatFocused || confirmAction) return;
     const agent = getSelected();
     if (!agent) return;
     if (agent.status !== 'running') {
-      ui.setStatus(`{yellow-fg}${agent.name} is not running{/yellow-fg}`);
-      setTimeout(() => ui.setStatus('[s]tart [x]stop [r]estart [k]ill [c]ontext [/]filter [q]uit'), 2000);
+      ui.logBox.log(`{yellow-fg}${agent.name} is not running{/yellow-fg}`);
+      ui.screen.render();
       return;
     }
     runAgentctl('stop', agent.name);
   });
 
-  // Restart agent
   ui.screen.key(['r'], () => {
-    if (confirmAction) return;
+    if (chatFocused || confirmAction) return;
     const agent = getSelected();
     if (!agent) return;
     runAgentctl('restart', agent.name);
   });
 
-  // Kill agent (with confirmation)
   ui.screen.key(['K'], () => {
+    if (chatFocused) return;
     const agent = getSelected();
     if (!agent) return;
 
     if (confirmAction) {
       confirmAction = null;
-      ui.setStatus('[s]tart [x]stop [r]estart [k]ill [c]ontext [/]filter [q]uit');
+      updateStatusBar();
       ui.screen.render();
       return;
     }
@@ -569,7 +850,7 @@ function main() {
   });
 
   ui.screen.key(['y'], () => {
-    if (!confirmAction) return;
+    if (chatFocused || !confirmAction) return;
     const { action, agent } = confirmAction;
     confirmAction = null;
     if (action === 'kill') {
@@ -578,16 +859,16 @@ function main() {
   });
 
   ui.screen.key(['n'], () => {
+    if (chatFocused) return;
     if (confirmAction) {
       confirmAction = null;
-      ui.setStatus('[s]tart [x]stop [r]estart [k]ill [c]ontext [/]filter [q]uit');
+      updateStatusBar();
       ui.screen.render();
     }
   });
 
-  // Show context
   ui.screen.key(['c'], () => {
-    if (confirmAction) return;
+    if (chatFocused || confirmAction) return;
     const agent = getSelected();
     if (!agent) return;
 
@@ -602,22 +883,20 @@ function main() {
       const content = fs.readFileSync(contextFile, 'utf8');
       ui.logBox.setContent('');
       ui.logBox.setLabel(` context: ${agent.name} `);
-      const lines = content.split('\n');
-      for (const line of lines) {
+      for (const line of content.split('\n')) {
         ui.logBox.log(line);
       }
       ui.screen.render();
     } catch {}
   });
 
-  // Filter
   ui.screen.key(['/'], () => {
-    if (confirmAction) return;
+    if (chatFocused || confirmAction) return;
     const input = blessed.textbox({
       parent: ui.screen,
       bottom: 0,
       left: 0,
-      width: '100%',
+      width: '50%',
       height: 1,
       style: { fg: 'white', bg: 'blue' },
       inputOnFocus: true,
@@ -632,16 +911,20 @@ function main() {
       renderAgentList();
       renderDetail();
       if (filteredAgents.length > 0) switchLogStream();
-      ui.setStatus('[s]tart [x]stop [r]estart [k]ill [c]ontext [/]filter [q]uit');
+      updateStatusBar();
       ui.screen.render();
     });
   });
 
-  // Clear filter with Escape
   ui.screen.key(['escape'], () => {
+    if (chatFocused) {
+      ui.chatInput.clearValue();
+      setFocus('agents');
+      return;
+    }
     if (confirmAction) {
       confirmAction = null;
-      ui.setStatus('[s]tart [x]stop [r]estart [k]ill [c]ontext [/]filter [q]uit');
+      updateStatusBar();
       ui.screen.render();
       return;
     }
@@ -654,36 +937,50 @@ function main() {
     }
   });
 
-  // Log scrolling detection
-  ui.logBox.on('scroll', () => {
-    const scrollPerc = ui.logBox.getScrollPerc();
-    userScrolled = scrollPerc < 100;
-  });
-
-  // Tab to switch focus between panels
+  // Tab cycles focus
   ui.screen.key(['tab'], () => {
-    if (ui.logBox === ui.screen.focused) {
-      ui.agentList.focus();
-    } else {
-      ui.logBox.focus();
-    }
-    ui.screen.render();
+    if (confirmAction) return;
+    const order = ['agents', 'logs', 'chat'];
+    const idx = order.indexOf(focusPanel);
+    setFocus(order[(idx + 1) % order.length]);
   });
 
-  // Quit
-  ui.screen.key(['q', 'C-c'], () => {
+  // S-tab reverse cycles
+  ui.screen.key(['S-tab'], () => {
+    if (confirmAction) return;
+    const order = ['agents', 'logs', 'chat'];
+    const idx = order.indexOf(focusPanel);
+    setFocus(order[(idx - 1 + order.length) % order.length]);
+  });
+
+  // Log scroll detection
+  ui.logBox.on('scroll', () => {
+    userScrolledLog = ui.logBox.getScrollPerc() < 100;
+  });
+
+  // Quit (only when not in chat input)
+  ui.screen.key(['q'], () => {
+    if (chatFocused) return;
+    cleanup();
+  });
+
+  ui.screen.key(['C-c'], () => {
+    cleanup();
+  });
+
+  function cleanup() {
     logStreamer.stop();
+    chat.disconnect();
     process.exit(0);
-  });
+  }
 
-  // Initial load
-  ui.agentList.focus();
+  // --- Init ---
+  setFocus('agents');
   refresh();
   switchLogStream();
+  chat.connect();
 
-  // Poll loop
   const pollTimer = setInterval(refresh, POLL_INTERVAL);
-
   ui.screen.render();
 }
 
