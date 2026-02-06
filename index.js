@@ -458,7 +458,6 @@ function createUI() {
       border: { fg: 'magenta' },
       fg: 'white',
     },
-    inputOnFocus: true,
     keys: true,
     mouse: true,
   });
@@ -679,6 +678,8 @@ function main() {
 
   // --- Focus management ---
 
+  let chatReading = false;
+
   function setFocus(panel) {
     focusPanel = panel;
     chatFocused = panel === 'chat';
@@ -700,8 +701,10 @@ function main() {
         break;
       case 'chat':
         ui.chatLog.style.border.fg = 'white';
-        ui.chatInput.focus();
-        ui.chatInput.readInput(() => {});
+        if (!chatReading) {
+          chatReading = true;
+          ui.chatInput.readInput(() => { chatReading = false; });
+        }
         break;
     }
 
@@ -721,35 +724,37 @@ function main() {
   });
 
   // Chat input handling
-  ui.chatInput.on('submit', (value) => {
-    if (!value || !value.trim()) {
-      setFocus('chat');
-      return;
-    }
-
-    const text = value.trim();
-
-    // Handle /join command
-    const joinMatch = text.match(/^\/join\s+(#\S+)/);
-    if (joinMatch) {
-      const newChannel = joinMatch[1];
-      chat.switchChannel(newChannel);
-      ui.chatLog.setContent('');
-      ui.chatLog.setLabel(` ${newChannel} `);
-      ui.chatInput.clearValue();
-      setFocus('chat');
+  function rearmChatInput() {
+    chatReading = true;
+    process.nextTick(() => {
+      ui.chatInput.readInput(() => { chatReading = false; });
       ui.screen.render();
-      return;
+    });
+  }
+
+  ui.chatInput.on('submit', (value) => {
+    if (value && value.trim()) {
+      const text = value.trim();
+
+      // Handle /join command
+      const joinMatch = text.match(/^\/join\s+(#\S+)/);
+      if (joinMatch) {
+        const newChannel = joinMatch[1];
+        chat.switchChannel(newChannel);
+        ui.chatLog.setContent('');
+        ui.chatLog.setLabel(` ${newChannel} `);
+      } else {
+        chat.send(text);
+      }
     }
 
-    chat.send(text);
     ui.chatInput.clearValue();
-    setFocus('chat');
-    ui.screen.render();
+    rearmChatInput();
   });
 
   ui.chatInput.on('cancel', () => {
     ui.chatInput.clearValue();
+    chatReading = false;
     setFocus('agents');
   });
 
