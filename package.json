@@ -1,0 +1,19 @@
+{
+  "name": "agentctl-tui",
+  "version": "1.0.0",
+  "description": "Interactive terminal dashboard for managing supervised claude agents",
+  "main": "index.js",
+  "bin": {
+    "agentctl-tui": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "blessed": "^0.1.81"
+  }
+}
