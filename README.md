@@ -118,3 +118,17 @@ This software is experimental and provided as-is. It is intended for research, d
 ## License
 
 ISC
+
+### Remote server safety
+
+By default, AgentTUI only allows connecting to a local AgentChat server (localhost / 127.0.0.1).
+
+To connect to a remote AgentChat server, you must explicitly opt in:
+
+```bash
+AGENTTUI_ALLOW_REMOTE=1 node index.js --server wss://agentchat-server.fly.dev
+# or
+node index.js --allow-remote --server wss://agentchat-server.fly.dev
+```
+
+This is intentional: AgentTUI is an admin tool and should not be casually pointed at remote servers.

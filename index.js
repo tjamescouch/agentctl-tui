@@ -23,19 +23,23 @@ const POLL_INTERVAL = 3000;
 const LOG_TAIL_LINES = 100;
 const DEBOUNCE_MS = 100;
 const AGENTCHAT_PUBLIC = process.env.AGENTCHAT_PUBLIC === 'true';
+// AgentTUI is an admin tool; default to local-only connectivity.
+// Allowing remote servers requires an explicit opt-in.
+const AGENTTUI_ALLOW_REMOTE =
+  args.includes('--allow-remote') || (process.env.AGENTTUI_ALLOW_REMOTE === '1' || process.env.AGENTTUI_ALLOW_REMOTE === 'true');
 const CHAT_SERVER = (() => {
   const explicit = getArg('server', process.env.AGENTCHAT_URL);
   if (explicit) {
     const parsed = new URL(explicit);
     const isLocal = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '::1';
-    if (!isLocal && !AGENTCHAT_PUBLIC) {
-      console.error(`ERROR: server points to remote host "${parsed.hostname}" but AGENTCHAT_PUBLIC is not set.`);
-      console.error('Set AGENTCHAT_PUBLIC=true to allow connections to non-localhost servers.');
+    if (!isLocal && !(AGENTCHAT_PUBLIC || AGENTTUI_ALLOW_REMOTE)) {
+      console.error(`ERROR: server points to remote host "${parsed.hostname}" but remote access is not enabled.`);
+      console.error("Set AGENTTUI_ALLOW_REMOTE=1 (or pass --allow-remote). (AGENTCHAT_PUBLIC=true also allows remote servers.)");
       process.exit(1);
     }
     return explicit;
   }
-  return AGENTCHAT_PUBLIC ? 'wss://agentchat-server.fly.dev' : 'ws://localhost:6667';
+  return AGENTCHAT_PUBLIC ? 'wss://agentchat-server.fly.dev' : 'ws://127.0.0.1:6667';
 })();
 const CHAT_NAME = getArg('name', process.env.AGENTCHAT_NAME || 'tui');
 const IDENTITY_PATH = (() => {
