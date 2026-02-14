@@ -1,4 +1,4 @@
-# agentctl-tui
+# agenttui
 
 Interactive terminal dashboard for managing supervised Claude agents. Wraps `agentctl.sh` in a [blessed](https://github.com/chjj/blessed)-based TUI with real-time status monitoring, log streaming, and live chat via [AgentChat](https://agentchat-server.fly.dev).
 
