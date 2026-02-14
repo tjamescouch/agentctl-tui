@@ -26,7 +26,7 @@ const AGENTCHAT_PUBLIC = process.env.AGENTCHAT_PUBLIC === 'true';
 // AgentTUI is an admin tool; default to local-only connectivity.
 // Allowing remote servers requires an explicit opt-in.
 const AGENTTUI_ALLOW_REMOTE =
-  args.includes('--allow-remote') || process.env.AGENTTUI_ALLOW_REMOTE === '1';
+  args.includes('--allow-remote') || (process.env.AGENTTUI_ALLOW_REMOTE === '1' || process.env.AGENTTUI_ALLOW_REMOTE === 'true');
 const CHAT_SERVER = (() => {
   const explicit = getArg('server', process.env.AGENTCHAT_URL);
   if (explicit) {
@@ -34,7 +34,7 @@ const CHAT_SERVER = (() => {
     const isLocal = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '::1';
     if (!isLocal && !(AGENTCHAT_PUBLIC || AGENTTUI_ALLOW_REMOTE)) {
       console.error(`ERROR: server points to remote host "${parsed.hostname}" but remote access is not enabled.`);
-      console.error('Set AGENTTUI_ALLOW_REMOTE=1 (or pass --allow-remote) to allow remote servers.');
+      console.error("Set AGENTTUI_ALLOW_REMOTE=1 (or pass --allow-remote). (AGENTCHAT_PUBLIC=true also allows remote servers.)");
       process.exit(1);
     }
     return explicit;
