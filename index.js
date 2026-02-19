@@ -557,7 +557,7 @@ function createUI() {
     screen.render();
   }
 
-  setStatus('[s]tart [x]stop [r]estart [K]ill [c]ontext [/]filter [tab]focus [q]uit');
+  setStatus('[s]tart [x]stop [r]estart [K]ill [c]ontext [/]filter [tab]focus [M]copy [q]uit');
 
   return { screen, agentList, detailBox, logBox, chatLog, chatInput, statusBar, setStatus };
 }
@@ -858,26 +858,56 @@ function main() {
   });
 
   // Global keys (only when chat is NOT focused)
-  ui.screen.key(['j'], () => {
+  ui.screen.key(['j', 'down'], () => {
     if (chatFocused) return;
-    if (focusPanel === 'agents' && selectedIdx < filteredAgents.length - 1) {
-      selectedIdx++;
-      ui.agentList.select(selectedIdx);
-      renderDetail();
-      switchLogStream();
+    if (focusPanel === 'agents') {
+      if (selectedIdx < filteredAgents.length - 1) {
+        selectedIdx++;
+        ui.agentList.select(selectedIdx);
+        renderDetail();
+        switchLogStream();
+        ui.screen.render();
+      }
+    } else if (focusPanel === 'logs') {
+      ui.logBox.scroll(1);
+      userScrolledLog = true;
+      ui.screen.render();
+    } else if (focusPanel === 'chat') {
+      ui.chatLog.scroll(1);
       ui.screen.render();
     }
   });
 
-  ui.screen.key(['k'], () => {
+  ui.screen.key(['k', 'up'], () => {
     if (chatFocused) return;
-    if (focusPanel === 'agents' && selectedIdx > 0) {
-      selectedIdx--;
-      ui.agentList.select(selectedIdx);
-      renderDetail();
-      switchLogStream();
+    if (focusPanel === 'agents') {
+      if (selectedIdx > 0) {
+        selectedIdx--;
+        ui.agentList.select(selectedIdx);
+        renderDetail();
+        switchLogStream();
+        ui.screen.render();
+      }
+    } else if (focusPanel === 'logs') {
+      ui.logBox.scroll(-1);
+      userScrolledLog = true;
+      ui.screen.render();
+    } else if (focusPanel === 'chat') {
+      ui.chatLog.scroll(-1);
       ui.screen.render();
     }
+  });
+
+  ui.screen.key(['pageup'], () => {
+    if (chatFocused) return;
+    if (focusPanel === 'logs') { ui.logBox.scroll(-10); userScrolledLog = true; ui.screen.render(); }
+    else if (focusPanel === 'chat') { ui.chatLog.scroll(-10); ui.screen.render(); }
+  });
+
+  ui.screen.key(['pagedown'], () => {
+    if (chatFocused) return;
+    if (focusPanel === 'logs') { ui.logBox.scroll(10); userScrolledLog = true; ui.screen.render(); }
+    else if (focusPanel === 'chat') { ui.chatLog.scroll(10); ui.screen.render(); }
   });
 
   ui.screen.key(['s'], () => {
@@ -1026,18 +1056,20 @@ function main() {
     const helpLines = [
       '{bold}Keybindings:{/bold}',
       '',
-      '  {cyan-fg}Tab{/cyan-fg}       Cycle focus: agents → logs → chat',
-      '  {cyan-fg}Shift+Tab{/cyan-fg} Reverse cycle',
-      '  {cyan-fg}j/k{/cyan-fg}       Navigate agent list',
-      '  {cyan-fg}s{/cyan-fg}         Start selected agent',
-      '  {cyan-fg}x{/cyan-fg}         Stop selected agent',
-      '  {cyan-fg}r{/cyan-fg}         Restart selected agent',
-      '  {cyan-fg}K{/cyan-fg}         Kill selected agent (requires confirmation)',
-      '  {cyan-fg}c{/cyan-fg}         View agent context.md',
-      '  {cyan-fg}/{/cyan-fg}         Filter agents by name',
-      '  {cyan-fg}Escape{/cyan-fg}    Clear filter / exit chat / cancel',
-      '  {cyan-fg}?{/cyan-fg}         Show this help',
-      '  {cyan-fg}q{/cyan-fg}         Quit',
+      '  {cyan-fg}Tab{/cyan-fg}         Cycle focus: agents → logs → chat',
+      '  {cyan-fg}Shift+Tab{/cyan-fg}   Reverse cycle',
+      '  {cyan-fg}j/k or ↑/↓{/cyan-fg} Navigate agent list (or scroll logs/chat)',
+      '  {cyan-fg}PgUp/PgDn{/cyan-fg}   Scroll logs/chat by 10 lines',
+      '  {cyan-fg}M{/cyan-fg}           Toggle mouse copy mode (lets you drag-select text)',
+      '  {cyan-fg}s{/cyan-fg}           Start selected agent',
+      '  {cyan-fg}x{/cyan-fg}           Stop selected agent',
+      '  {cyan-fg}r{/cyan-fg}           Restart selected agent',
+      '  {cyan-fg}K{/cyan-fg}           Kill selected agent (requires confirmation)',
+      '  {cyan-fg}c{/cyan-fg}           View agent context.md',
+      '  {cyan-fg}/{/cyan-fg}           Filter agents by name',
+      '  {cyan-fg}Escape{/cyan-fg}      Clear filter / exit chat / cancel',
+      '  {cyan-fg}?{/cyan-fg}           Show this help',
+      '  {cyan-fg}q{/cyan-fg}           Quit',
       '',
       '{bold}Chat Commands:{/bold}',
       '',
@@ -1098,6 +1130,21 @@ function main() {
     const order = ['agents', 'logs', 'chat'];
     const idx = order.indexOf(focusPanel);
     setFocus(order[(idx - 1 + order.length) % order.length]);
+  });
+
+  // Mouse copy mode — toggle blessed mouse capture off so terminal can select text natively
+  let mouseCopyMode = false;
+  ui.screen.key(['M'], () => {
+    if (chatFocused) return;
+    mouseCopyMode = !mouseCopyMode;
+    if (mouseCopyMode) {
+      ui.screen.program.disableMouse();
+      ui.setStatus('{yellow-fg}COPY MODE — drag to select, M to exit{/yellow-fg}');
+    } else {
+      ui.screen.program.enableMouse();
+      updateStatusBar();
+    }
+    ui.screen.render();
   });
 
   // Log scroll detection
