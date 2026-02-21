@@ -262,10 +262,6 @@ function createChatClient(onMessage, onStatus) {
   let reconnectTimer = null;
   let intentionalClose = false;
   let agentId = null;
-  // Simple in-memory dedupe cache for recently-seen messages to avoid duplicates
-  // caused by server echoes or transient reconnects. Keys expire after a short window.
-  const MSG_DEDUPE_WINDOW_MS = 3000; // how long to remember message keys
-  const recentMsgKeys = new Map(); // key -> timeoutId
 
   async function connect() {
     if (client && client.connected) return;
@@ -292,28 +288,7 @@ function createChatClient(onMessage, onStatus) {
 
       // Wire up event handlers BEFORE connect to avoid race conditions
       client.on('message', (msg) => {
-        // Try to use a server-provided unique id if available
-        const keyParts = [];
-        if (msg.id) keyParts.push(msg.id);
-        if (msg.from) keyParts.push(msg.from);
-        if (msg.to) keyParts.push(msg.to);
-        if (msg.content) keyParts.push(String(msg.content).slice(0, 256));
-        const key = keyParts.join('|');
-
-        if (key && recentMsgKeys.has(key)) {
-          // duplicate within short window — ignore
-          return;
-        }
-
-        if (key) {
-          // remember for configured window
-          const t = setTimeout(() => recentMsgKeys.delete(key), MSG_DEDUPE_WINDOW_MS);
-          recentMsgKeys.set(key, t);
-        }
-
-        // If the server indicates this message is from ourselves, skip — but be conservative
-        if (msg.from && agentId && msg.from === agentId) return;
-
+        if (msg.from === agentId) return; // skip own messages
         const displayName = escapeTags(msg.from_name || msg.name || msg.from || '?');
         const channelLabel = msg.to?.startsWith('#') ? msg.to : 'DM';
         onMessage({
@@ -363,8 +338,6 @@ function createChatClient(onMessage, onStatus) {
 
       await client.connect();
       agentId = client.agentId;
-      // If a reconnect was scheduled, clear it now that we've connected.
-      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       onStatus('connected');
 
       // Join default channels
@@ -1301,10 +1274,6 @@ function renderAgentList() {
   ui.chatLog.log(`{grey-fg}--- Connecting to ${CHAT_SERVER} as ${identityInfo}{/grey-fg}`);
   ui.chatLog.log(`{grey-fg}--- Channels: ${DEFAULT_CHANNELS.join(', ')}{/grey-fg}`);
   ui.chatLog.log(`{grey-fg}--- Type /join #channel to switch, ? for help{/grey-fg}`);
-  // Helpful hint when defaulting to local server — users often expect remote connectivity.
-  if (!AGENTCHAT_PUBLIC && !AGENTTUI_ALLOW_REMOTE && (CHAT_SERVER.includes('127.0.0.1') || CHAT_SERVER.includes('localhost'))) {
-    ui.chatLog.log(`{yellow-fg}--- Note: agenttui is configured to connect to a local AgentChat server (${CHAT_SERVER}). If you intended to connect to the public server, run with {bold}AGENTTUI_ALLOW_REMOTE=1 --server wss://agentchat-server.fly.dev{/bold} or set {bold}AGENTCHAT_PUBLIC=true{/bold}.{\/yellow-fg}`);
-  }
 
   ui.screen.render();
 }
