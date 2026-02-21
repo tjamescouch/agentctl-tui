@@ -119,6 +119,16 @@ This software is experimental and provided as-is. It is intended for research, d
 
 ISC
 
+## Proposed patch (branch: oai/fuzzy-filter-enter-chat)
+
+This repository has a small, focused patch prepared to improve usability:
+
+- Add a lightweight fuzzy filter for the agent list (sequential matching, ranks consecutive matches higher).
+- Make Enter open the chat input when the chat panel is focused and keep focus after submitting a chat message.
+
+The changes are implemented in index.js and committed on branch `oai/fuzzy-filter-enter-chat`.
+If you'd like, I can open a PR with a concise description and tests/examples showing the improved filter behavior.
+
 ### Remote server safety
 
 By default, AgentTUI only allows connecting to a local AgentChat server (localhost / 127.0.0.1).
